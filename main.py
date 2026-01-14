@@ -1,8 +1,7 @@
-import sys
 import time
 import subprocess
 from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple
+from typing import Dict, Set, Optional
 
 import pygame
 
@@ -16,7 +15,8 @@ PROCESS_NAMES_TO_KILL = [
 ]
 
 HOLD_SECONDS = 3.0
-POLL_HZ = 60  # loop frequency (keep modest for CPU)
+POLL_HZ = 60  # loop frequency
+ACTION_COOLDOWN_SECONDS = 5.0  # prevents rapid re-triggering while still holding
 
 
 # -------------------------
@@ -35,8 +35,6 @@ class ButtonInput:
 # PROCESS CONTROL
 # -------------------------
 def _run_tasklist_csv() -> str:
-    # /FO CSV makes parsing more reliable, /NH removes header line
-    # Note: tasklist is built-in on Windows.
     cp = subprocess.run(
         ["tasklist", "/FO", "CSV", "/NH"],
         capture_output=True,
@@ -50,17 +48,11 @@ def _run_tasklist_csv() -> str:
 
 def is_process_running(process_name: str) -> bool:
     output = _run_tasklist_csv()
-    # Each line is like: "Image Name","PID","Session Name","Session#","Mem Usage"
-    # We just search for the exact "process_name" token.
     needle = f"\"{process_name}\""
     return needle.lower() in output.lower()
 
 
 def kill_process_by_name(process_name: str) -> bool:
-    """
-    Returns True if we *attempted* to kill something (i.e., it looked running),
-    False if it wasn't found.
-    """
     if not is_process_running(process_name):
         print(f"[kill] Not running: {process_name}")
         return False
@@ -87,8 +79,8 @@ def kill_process_by_name(process_name: str) -> bool:
     return True
 
 
-def on_combo_held_action() -> None:
-    print("[action] Combo held long enough. Killing configured processes if found...")
+def on_hold_action(trigger_btn: ButtonInput) -> None:
+    print(f"[action] Triggered by holding {trigger_btn} for {HOLD_SECONDS:.2f}s. Killing configured processes if found...")
     for name in PROCESS_NAMES_TO_KILL:
         try:
             kill_process_by_name(name)
@@ -121,8 +113,6 @@ def init_pygame_and_joysticks() -> Dict[int, pygame.joystick.Joystick]:
 
 
 def pump_events_nonblocking() -> None:
-    # Keeps pygame's internal state updated and processes OS events.
-    # We intentionally do NOT block in event.wait().
     pygame.event.pump()
 
 
@@ -136,18 +126,11 @@ def read_current_pressed_buttons(joysticks: Dict[int, pygame.joystick.Joystick])
     return pressed
 
 
-def button_name_hint(btn: ButtonInput) -> str:
-    # Pygame only gives index. We can at least show controller name.
-    # (Different controllers map face buttons differently.)
-    return str(btn)
-
-
-
-
-def collect_combo_inputs(joysticks: Dict[int, pygame.joystick.Joystick]) -> Set[ButtonInput]:
+def collect_buttons_to_trigger(joysticks: Dict[int, pygame.joystick.Joystick]) -> Set[ButtonInput]:
     import threading
 
-    print("\n[setup] Press any buttons on any controller to add them to the combo.")
+    print("\n[setup] Press any buttons on any controller to add them as individual triggers.")
+    print("[setup] OR logic: holding ANY chosen button for the hold duration will trigger the action.")
     print("[setup] Press ENTER in this console when you're done selecting.\n")
 
     chosen: Set[ButtonInput] = set()
@@ -156,16 +139,13 @@ def collect_combo_inputs(joysticks: Dict[int, pygame.joystick.Joystick]) -> Set[
     done_event = threading.Event()
 
     def wait_for_enter():
-        # Blocks until user presses Enter, but runs in a daemon thread
         try:
             input()
             done_event.set()
         except Exception:
-            # If stdin is unavailable, just never set; main loop still Ctrl+C-able
             pass
 
-    t = threading.Thread(target=wait_for_enter, daemon=True)
-    t.start()
+    threading.Thread(target=wait_for_enter, daemon=True).start()
 
     print("[setup] Waiting for button presses... (Press ENTER to finish)")
 
@@ -178,18 +158,15 @@ def collect_combo_inputs(joysticks: Dict[int, pygame.joystick.Joystick]) -> Set[
             if new_presses:
                 for btn in sorted(new_presses, key=lambda x: (x.joystick_id, x.button_index)):
                     chosen.add(btn)
-                    print(f"[setup] Added: {button_name_hint(btn)}")
+                    print(f"[setup] Added trigger button: {btn}")
 
             if chosen != last_printed:
                 last_printed = set(chosen)
                 if chosen:
-                    pretty = ", ".join(
-                        button_name_hint(b)
-                        for b in sorted(chosen, key=lambda x: (x.joystick_id, x.button_index))
-                    )
-                    print(f"[setup] Current combo set: {pretty}")
+                    pretty = ", ".join(str(b) for b in sorted(chosen, key=lambda x: (x.joystick_id, x.button_index)))
+                    print(f"[setup] Current trigger set: {pretty}")
                 else:
-                    print("[setup] Current combo set: (none)")
+                    print("[setup] Current trigger set: (none)")
 
             time.sleep(1.0 / POLL_HZ)
 
@@ -202,46 +179,62 @@ def collect_combo_inputs(joysticks: Dict[int, pygame.joystick.Joystick]) -> Set[
     if not chosen:
         print("[setup] WARNING: You didn't select any buttons. Monitoring will never trigger.")
     else:
-        pretty = ", ".join(
-            button_name_hint(b)
-            for b in sorted(chosen, key=lambda x: (x.joystick_id, x.button_index))
-        )
-        print(f"[setup] Final chosen combo: {pretty}\n")
+        pretty = ", ".join(str(b) for b in sorted(chosen, key=lambda x: (x.joystick_id, x.button_index)))
+        print(f"[setup] Final trigger buttons: {pretty}\n")
 
     return chosen
 
 
-def monitor_combo_forever(joysticks: Dict[int, pygame.joystick.Joystick], combo: Set[ButtonInput]) -> None:
-    print(f"[monitor] Monitoring for combo hold: {HOLD_SECONDS:.1f}s")
+def monitor_triggers_forever(joysticks: Dict[int, pygame.joystick.Joystick], triggers: Set[ButtonInput]) -> None:
+    print(f"[monitor] OR-mode monitoring: hold ANY chosen button for {HOLD_SECONDS:.1f}s to trigger.")
+    print(f"[monitor] Cooldown after trigger: {ACTION_COOLDOWN_SECONDS:.1f}s")
     print("[monitor] Press Ctrl+C to exit.\n")
 
-    hold_start: float | None = None
-    triggered = False  # prevents repeat spam while still holding
+    # For each trigger button: when did we start holding it (monotonic time)?
+    hold_start_by_btn: Dict[ButtonInput, float] = {}
+
+    # Per-button cooldown timestamp: next time this button is allowed to trigger
+    next_allowed_trigger_by_btn: Dict[ButtonInput, float] = {}
+
+    # For logging throttling (avoid spam)
+    last_hold_log_bucket_by_btn: Dict[ButtonInput, int] = {}
 
     while True:
         pump_events_nonblocking()
+        now = time.monotonic()
         pressed_now = read_current_pressed_buttons(joysticks)
 
-        if combo and combo.issubset(pressed_now):
-            if hold_start is None:
-                hold_start = time.monotonic()
-                triggered = False
-                print(f"[monitor] Combo pressed. Starting hold timer...")
-            else:
-                elapsed = time.monotonic() - hold_start
-                # Be verbose but not insane: print at ~4 Hz while holding
-                if int(elapsed * 4) != int((elapsed - (1.0 / POLL_HZ)) * 4):
-                    print(f"[monitor] Holding... {elapsed:.2f}/{HOLD_SECONDS:.2f}s")
+        # Update each trigger button independently
+        for btn in triggers:
+            is_pressed = btn in pressed_now
 
-                if (not triggered) and elapsed >= HOLD_SECONDS:
-                    print(f"[monitor] Held for {elapsed:.2f}s (>= {HOLD_SECONDS:.2f}s). Triggering action!")
-                    on_combo_held_action()
-                    triggered = True
-        else:
-            if hold_start is not None:
-                print("[monitor] Combo released/reset.")
-            hold_start = None
-            triggered = False
+            if is_pressed:
+                if btn not in hold_start_by_btn:
+                    hold_start_by_btn[btn] = now
+                    last_hold_log_bucket_by_btn.pop(btn, None)
+                    print(f"[monitor] {btn} pressed. Starting hold timer...")
+
+                elapsed = now - hold_start_by_btn[btn]
+
+                # Log at ~4Hz while holding (bucketed)
+                bucket = int(elapsed * 4)
+                if last_hold_log_bucket_by_btn.get(btn) != bucket:
+                    last_hold_log_bucket_by_btn[btn] = bucket
+                    print(f"[monitor] Holding {btn}... {elapsed:.2f}/{HOLD_SECONDS:.2f}s")
+
+                # Trigger if held long enough and not in cooldown
+                next_allowed = next_allowed_trigger_by_btn.get(btn, 0.0)
+                if elapsed >= HOLD_SECONDS and now >= next_allowed:
+                    print(f"[monitor] {btn} held for {elapsed:.2f}s (>= {HOLD_SECONDS:.2f}s). Triggering action!")
+                    on_hold_action(btn)
+                    next_allowed_trigger_by_btn[btn] = now + ACTION_COOLDOWN_SECONDS
+
+            else:
+                if btn in hold_start_by_btn:
+                    # Button released -> reset timer
+                    print(f"[monitor] {btn} released/reset.")
+                    hold_start_by_btn.pop(btn, None)
+                    last_hold_log_bucket_by_btn.pop(btn, None)
 
         time.sleep(1.0 / POLL_HZ)
 
@@ -252,10 +245,10 @@ def main() -> int:
         print("[main] No controllers available. Exiting.")
         return 1
 
-    combo = collect_combo_inputs(joysticks)
+    triggers = collect_buttons_to_trigger(joysticks)
 
     try:
-        monitor_combo_forever(joysticks, combo)
+        monitor_triggers_forever(joysticks, triggers)
     except KeyboardInterrupt:
         print("\n[main] Ctrl+C received. Shutting down cleanly...")
     finally:
