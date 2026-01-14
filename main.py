@@ -1,7 +1,8 @@
 import time
 import subprocess
+import ctypes
 from dataclasses import dataclass
-from typing import Dict, Set, Optional
+from typing import Dict, Set
 
 import pygame
 
@@ -17,6 +18,15 @@ PROCESS_NAMES_TO_KILL = [
 HOLD_SECONDS = 3.0
 POLL_HZ = 60  # loop frequency
 ACTION_COOLDOWN_SECONDS = 5.0  # prevents rapid re-triggering while still holding
+
+# Optional: move mouse off-screen if BOTH of these processes are running.
+ENABLE_MOUSE_OFFSCREEN_WHEN_BOTH_RUNNING = True
+MOUSE_OFFSCREEN_CHECK_EVERY_SECONDS = 3.0
+MOUSE_OFFSCREEN_PROCESS_A = "TeknoParrotUi.exe"
+MOUSE_OFFSCREEN_PROCESS_B = "emulatorlauncher.exe"
+# Negative coordinates usually put the cursor off the top-left on Windows.
+MOUSE_OFFSCREEN_X = -10000
+MOUSE_OFFSCREEN_Y = -10000
 
 
 # -------------------------
@@ -87,6 +97,30 @@ def on_hold_action(trigger_btn: ButtonInput) -> None:
         except Exception as e:
             print(f"[action] ERROR killing {name}: {e}")
     print("[action] Done.\n")
+
+
+# -------------------------
+# MOUSE CONTROL (optional)
+# -------------------------
+def move_mouse_offscreen(x: int, y: int) -> None:
+    # WinAPI: BOOL SetCursorPos(int X, int Y);
+    # Using ctypes avoids extra dependencies.
+    try:
+        ctypes.windll.user32.SetCursorPos(int(x), int(y))
+        print(f"[mouse] Moved cursor to off-screen position ({x}, {y})")
+    except Exception as e:
+        print(f"[mouse] ERROR moving cursor: {e}")
+
+
+def maybe_move_mouse_offscreen_if_both_running() -> None:
+    a = is_process_running(MOUSE_OFFSCREEN_PROCESS_A)
+    b = is_process_running(MOUSE_OFFSCREEN_PROCESS_B)
+
+    print(f"[mouse] Check: {MOUSE_OFFSCREEN_PROCESS_A}={'RUNNING' if a else 'not running'}, "
+          f"{MOUSE_OFFSCREEN_PROCESS_B}={'RUNNING' if b else 'not running'}")
+
+    if a and b:
+        move_mouse_offscreen(MOUSE_OFFSCREEN_X, MOUSE_OFFSCREEN_Y)
 
 
 # -------------------------
@@ -188,23 +222,28 @@ def collect_buttons_to_trigger(joysticks: Dict[int, pygame.joystick.Joystick]) -
 def monitor_triggers_forever(joysticks: Dict[int, pygame.joystick.Joystick], triggers: Set[ButtonInput]) -> None:
     print(f"[monitor] OR-mode monitoring: hold ANY chosen button for {HOLD_SECONDS:.1f}s to trigger.")
     print(f"[monitor] Cooldown after trigger: {ACTION_COOLDOWN_SECONDS:.1f}s")
+    if ENABLE_MOUSE_OFFSCREEN_WHEN_BOTH_RUNNING:
+        print(f"[monitor] Mouse off-screen check enabled (every {MOUSE_OFFSCREEN_CHECK_EVERY_SECONDS:.1f}s).")
     print("[monitor] Press Ctrl+C to exit.\n")
 
-    # For each trigger button: when did we start holding it (monotonic time)?
     hold_start_by_btn: Dict[ButtonInput, float] = {}
-
-    # Per-button cooldown timestamp: next time this button is allowed to trigger
     next_allowed_trigger_by_btn: Dict[ButtonInput, float] = {}
-
-    # For logging throttling (avoid spam)
     last_hold_log_bucket_by_btn: Dict[ButtonInput, int] = {}
+
+    next_mouse_check_time = 0.0  # monotonic timestamp
 
     while True:
         pump_events_nonblocking()
         now = time.monotonic()
+
+        # Periodic optional mouse check (non-blocking schedule)
+        if ENABLE_MOUSE_OFFSCREEN_WHEN_BOTH_RUNNING and now >= next_mouse_check_time:
+            print("[mouse] Performing periodic check...")
+            maybe_move_mouse_offscreen_if_both_running()
+            next_mouse_check_time = now + MOUSE_OFFSCREEN_CHECK_EVERY_SECONDS
+
         pressed_now = read_current_pressed_buttons(joysticks)
 
-        # Update each trigger button independently
         for btn in triggers:
             is_pressed = btn in pressed_now
 
@@ -216,13 +255,11 @@ def monitor_triggers_forever(joysticks: Dict[int, pygame.joystick.Joystick], tri
 
                 elapsed = now - hold_start_by_btn[btn]
 
-                # Log at ~4Hz while holding (bucketed)
-                bucket = int(elapsed * 4)
+                bucket = int(elapsed * 4)  # ~4Hz logging
                 if last_hold_log_bucket_by_btn.get(btn) != bucket:
                     last_hold_log_bucket_by_btn[btn] = bucket
                     print(f"[monitor] Holding {btn}... {elapsed:.2f}/{HOLD_SECONDS:.2f}s")
 
-                # Trigger if held long enough and not in cooldown
                 next_allowed = next_allowed_trigger_by_btn.get(btn, 0.0)
                 if elapsed >= HOLD_SECONDS and now >= next_allowed:
                     print(f"[monitor] {btn} held for {elapsed:.2f}s (>= {HOLD_SECONDS:.2f}s). Triggering action!")
@@ -231,7 +268,6 @@ def monitor_triggers_forever(joysticks: Dict[int, pygame.joystick.Joystick], tri
 
             else:
                 if btn in hold_start_by_btn:
-                    # Button released -> reset timer
                     print(f"[monitor] {btn} released/reset.")
                     hold_start_by_btn.pop(btn, None)
                     last_hold_log_bucket_by_btn.pop(btn, None)
